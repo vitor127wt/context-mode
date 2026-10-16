@@ -150,13 +150,14 @@ context-mode hook gemini-cli sessionstart
 
 **Hook Paradigm:** TS Plugin
 
-OpenCode uses a TypeScript plugin paradigm instead of JSON stdin/stdout. Hooks and the 11 `ctx_*` tools are registered via the `plugin` array in `opencode.json`; no separate `mcp` block or stdio MCP child is required.
+OpenCode uses a TypeScript plugin paradigm instead of JSON stdin/stdout. The plugin supports OpenCode 2 via the native `setup` API while preserving the legacy `server` export for OpenCode v1 and KiloCode. All 11 `ctx_*` tools are registered natively without MCP, and hooks run in-process with no stdio child.
 
 **Hook Names:**
-- `tool.execute.before` -- equivalent to PreToolUse
-- `tool.execute.after` -- equivalent to PostToolUse
-- `experimental.session.compacting` -- equivalent to PreCompact (experimental)
-- `experimental.chat.system.transform` -- SessionStart-equivalent (cross-session resume injection)
+- `tool.execute.before` (V2: `ctx.tool.hook('execute.before')`) -- equivalent to PreToolUse
+- `tool.execute.after` (V2: `ctx.tool.hook('execute.after')`) -- equivalent to PostToolUse
+- `chat.message` (V2: `ctx.session.hook('prompt')`) -- equivalent to UserPromptSubmit
+- `experimental.chat.system.transform` (V2: `ctx.session.hook('context')`) -- SessionStart-equivalent (cross-session resume injection)
+- `experimental.session.compacting` (V2: `ctx.session.hook('compaction')`) -- equivalent to PreCompact (experimental)
 
 **Blocking:** `throw Error` in `tool.execute.before` handler
 

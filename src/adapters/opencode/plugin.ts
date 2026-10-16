@@ -13,6 +13,7 @@
  *
  * OpenCode loads this via: import("context-mode/plugin") → also supports
  * the named export ContextModePlugin for backward compat.
+ * OpenCode 2 calls default.setup and registers tools/hooks on its context.
  *
  * Constraints:
  *   - No SessionStart hook (OpenCode doesn't support it — #14808, #5409)
@@ -20,6 +21,8 @@
  *   - No routing file auto-write (avoid dirtying project trees)
  *   - Session cleanup happens at plugin init (no SessionStart)
  */
+
+import z from "zod/v4";
 
 import { dirname, resolve, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -252,16 +255,54 @@ function getPlatform(): AdapterPlatformType {
   return "opencode";
 }
 
-// ── Plugin Factory ────────────────────────────────────────
+// Deliberately structural, narrow subsets of @opencode/plugin's public V2 API.
+// Importing that package at runtime would break V1/Kilo consumers on import.
+type SystemPart = { type: "text"; text: string; metadata?: Record<string, unknown> };
+type ToolCall = { tool: string; sessionID: string; id: string; input: unknown };
+type ToolResult = {
+  content?: string | ReadonlyArray<{ type: string; text?: string }>;
+  output?: unknown;
+};
+type ToolHooks = {
+  "execute.before": ToolCall;
+  "execute.after": ToolCall & (
+    { status: "completed"; result: ToolResult } | { status: "error"; error: { message: string } }
+  );
+};
+type SessionHooks = {
+  prompt: { sessionID: string; prompt: { text: string } };
+  context: { sessionID: string; system: SystemPart[] };
+  compaction: { sessionID: string; system: SystemPart[] };
+};
+type V2ToolContext = {
+  sessionID: string; messageID: string; agent: string; signal?: AbortSignal;
+  progress(update: Record<string, unknown>): Promise<void>;
+};
+type V2Tool = {
+  name: string; description: string; options: { namespace: string };
+  input: z.ZodObject<Record<string, z.ZodType>>;
+  execute(input: Record<string, unknown>, ctx: V2ToolContext): Promise<{
+    content: string; metadata: { title: string };
+  }>;
+};
+type V2Event = {
+  id: string; type: string; location?: { directory: string }; data: unknown;
+};
+type V2Context = {
+  location: { directory: string };
+  tool: {
+    transform(callback: (editor: { add(tool: V2Tool): void }) => void): Promise<unknown>;
+    hook<K extends keyof ToolHooks>(name: K, callback: (event: ToolHooks[K]) => Promise<void>): Promise<unknown>;
+  };
+  session: {
+    hook<K extends keyof SessionHooks>(name: K, callback: (event: SessionHooks[K]) => Promise<void>): Promise<unknown>;
+  };
+  event: { subscribe(options: { signal: AbortSignal }): AsyncIterable<V2Event> };
+};
+type Log = (message: string, extra?: PluginClientAppLogBodyExtra) => Promise<void>;
 
-/**
- * Plugin factory. Called once when KiloCode/OpenCode loads the plugin.
- * Returns an object mapping hook event names to async handler functions.
- *
- * KiloCode expects: export default { id: string, server: (input) => Promise<Hooks> }
- * OpenCode expects: export const ContextModePlugin = (ctx) => Promise<Hooks>
- */
-async function createContextModePlugin(ctx: PluginContext) {
+// Shared operations retain legacy behavior; only host payloads differ.
+async function initializePlugin(projectDir: string, log: Log) {
   // Resolve build dir from compiled JS location
   const platform = getPlatform();
   const adapter = new OpenCodeAdapter(platform);
@@ -295,7 +336,6 @@ async function createContextModePlugin(ctx: PluginContext) {
   // OpenCode/Kilo provide the real `input.sessionID` on every hook, and a
   // process-global UUID would (a) never match prior-session resume rows and
   // (b) collide across multi-session reuse (Mickey / PR #376 root cause).
-  const projectDir = ctx?.directory ?? process.cwd();
   // C2 narrowing: resolve DB path through the canonical helper directly.
   // BaseAdapter no longer exposes getSessionDBPath; the adapter only owns
   // the sessions DIR (per-platform), the helper owns the per-project FILE
@@ -355,14 +395,7 @@ async function createContextModePlugin(ctx: PluginContext) {
     message = "context-mode debug log",
     extra?: PluginClientAppLogBodyExtra,
   ): Promise<void> {
-    return ctx.client.app.log({
-      body: {
-        service: "context-mode-logger",
-        level: "info",
-        message,
-        extra,
-      },
-    });
+    return log(message, extra);
   }
 
   /**
@@ -477,20 +510,25 @@ async function createContextModePlugin(ctx: PluginContext) {
     return tools;
   }
 
-  const nativeTools = await buildNativeTools();
+  let nativeTools: Record<string, NativeToolDefinition>;
+  try {
+    nativeTools = await buildNativeTools();
+  } catch (error) {
+    db.close();
+    throw error;
+  }
 
   return {
     tool: nativeTools,
+    db,
 
     // ── PreToolUse: Routing enforcement ─────────────────
 
-    "tool.execute.before": async (input: BeforeHookInput, output: BeforeHookOutput) => {
-      const toolName = input.tool ?? "";
-      const toolInput = output.args ?? {};
+    before: async (toolName: string, toolInput: Record<string, unknown>, sessionID?: string, nativeToolsAvailable = false) => {
 
       let decision;
       try {
-        decision = routing.routePreToolUse(toolName, toolInput, projectDir, platform);
+        decision = routing.routePreToolUse(toolName, toolInput, projectDir, platform, sessionID, { nativeToolsAvailable });
       } catch {
         return; // Routing failure → allow passthrough
       }
@@ -504,19 +542,18 @@ async function createContextModePlugin(ctx: PluginContext) {
 
       if (decision.action === "modify" && decision.updatedInput) {
         // Mutate output.args — OpenCode reads the mutated output object
-        Object.assign(output.args, decision.updatedInput);
+        Object.assign(toolInput, decision.updatedInput);
       }
 
       if (decision.action === "context" && decision.additionalContext) {
         // Mutate output.args — OpenCode reads the mutated output object
-        output.args.additionalContext = decision.additionalContext;
+        toolInput.additionalContext = decision.additionalContext;
       }
     },
 
     // ── PostToolUse: Session event capture ──────────────
 
-    "tool.execute.after": async (input: AfterHookInput, output: AfterHookOutput) => {
-      const sessionId = input.sessionID;
+    after: async (sessionId: string, toolName: string, args: Record<string, unknown>, response: string, isError?: boolean) => {
       if (!sessionId) return;
       try {
         db.ensureSession(sessionId, projectDir);
@@ -525,10 +562,10 @@ async function createContextModePlugin(ctx: PluginContext) {
         captureAgentsMd(sessionId);
 
         const hookInput: HookInput = {
-          tool_name: input.tool ?? "",
-          tool_input: input.args ?? {},
-          tool_response: output.output,
-          tool_output: undefined, // OpenCode doesn't provide isError
+          tool_name: toolName,
+          tool_input: args,
+          tool_response: response,
+          tool_output: isError === undefined ? undefined : { isError },
         };
 
         const events = extractEvents(hookInput);
@@ -559,20 +596,19 @@ async function createContextModePlugin(ctx: PluginContext) {
     // last-step token telemetry. db.insertEvent both persists locally AND
     // forwards to the platform (the TS-plugin equivalent of the .mjs
     // attributeAndInsertEvents path).
-    event: async (input: EventHookInput) => {
+    usage: async (sessionId: string, payload: unknown, identity?: string) => {
       try {
-        const ev = input?.event;
-        if (!ev || ev.type !== "message.updated") return;
-        const sessionId = ev.properties?.info?.sessionID;
-        if (!sessionId || typeof sessionId !== "string") return;
-
-        const counts = parseOpencodeUsage(ev);
+        if (!sessionId) return;
+        const counts = parseOpencodeUsage(payload);
         if (!counts) return;
         const usageEvent = buildAgentUsageEvent(counts);
         if (!usageEvent) return;
 
         db.ensureSession(sessionId, projectDir);
-        db.insertEvent(sessionId, usageEvent, "MessageUpdated");
+        // Distinct V2 steps may have identical usage. Preserve their durable
+        // identity so SessionDB's content dedup does not discard valid charges.
+        if (identity) usageEvent.data += ` model:${counts.model_id} step:${identity}`;
+        db.insertEvent(sessionId, usageEvent, identity ? "StepEnded" : "MessageUpdated");
       } catch {
         // Silent — usage capture must never break the session.
       }
@@ -584,15 +620,10 @@ async function createContextModePlugin(ctx: PluginContext) {
     // opencode-orchestrator/src/plugin-handlers/chat-message-handler.ts:41-65.
     // CCv2 inline filter: skip synthetic harness messages (system reminders,
     // tool results, etc.) so we don't pollute the user-prompt event stream.
-    "chat.message": async (input: ChatMessageHookInput, output: ChatMessageHookOutput) => {
-      const sessionId = input?.sessionID;
+    prompt: async (sessionId: string, message: string) => {
       if (!sessionId) return;
       try {
-        const parts = Array.isArray(output?.parts) ? output.parts : [];
-        const textPart = parts.find((p) => p && p.type === "text" && typeof p.text === "string" && p.text.length > 0);
-        if (!textPart || !textPart.text) return;
-        const message = textPart.text;
-        if (isSyntheticMessage(message)) return;
+        if (!message || isSyntheticMessage(message)) return;
 
         db.ensureSession(sessionId, projectDir);
         // OC-4 (#487 follow-up): also capture on chat.message so sessions that
@@ -619,8 +650,7 @@ async function createContextModePlugin(ctx: PluginContext) {
 
     // ── PreCompact: Snapshot generation ─────────────────
 
-    "experimental.session.compacting": async (input: CompactingHookInput, output: CompactingHookOutput) => {
-      const sessionId = input.sessionID;
+    compact: async (sessionId: string, context: string[]) => {
       if (!sessionId) return "";
       try {
         db.ensureSession(sessionId, projectDir);
@@ -636,7 +666,7 @@ async function createContextModePlugin(ctx: PluginContext) {
         db.incrementCompactCount(sessionId);
 
         // Mutate output.context to inject the snapshot
-        output.context.push(snapshot);
+        context.push(snapshot);
 
         if (process.env.OPENCODE_DEBUG) {
           await safeLog(snapshot, {
@@ -652,7 +682,7 @@ async function createContextModePlugin(ctx: PluginContext) {
         try {
           const autoBlock: string = autoInjectionMod.buildAutoInjection(events);
           if (autoBlock && autoBlock.length > 0) {
-            output.context.push(autoBlock);
+            context.push(autoBlock);
           }
 
           if (process.env.OPENCODE_DEBUG) {
@@ -678,11 +708,7 @@ async function createContextModePlugin(ctx: PluginContext) {
     //   output: { system: string[] }
     // We claim the most-recent unconsumed resume snapshot atomically (race-
     // safe across concurrent processes) and prepend it to the system prompt.
-    "experimental.chat.system.transform": async (
-      input: SystemTransformHookInput,
-      output: SystemTransformHookOutput,
-    ) => {
-      const sessionId = input?.sessionID;
+    system: async <Part>(sessionId: string | undefined, system: Part[], text: (part: Part) => string, part: (text: string) => Part) => {
       if (!sessionId) return;
 
       // ── OC-1 / CCv1: ROUTING_BLOCK injection ──────────────
@@ -697,16 +723,16 @@ async function createContextModePlugin(ctx: PluginContext) {
       // Detect by checking for a quorum of distinctive tool names — any two
       // of ctx_execute, ctx_batch_execute, ctx_fetch_and_index confirms the
       // instructions are present and avoids ~2K chars of duplication.
-      if (Array.isArray(output?.system)) {
-        if (!systemHasRoutingInstructions(output.system)) {
+      if (Array.isArray(system)) {
+        if (!systemHasRoutingInstructions(system.map(text))) {
           try {
-            output.system.splice(1, 0, routingBlock);
+            system.splice(1, 0, part(routingBlock));
           } catch {
             // Never break the chat turn on routing-block injection failure.
           }
 
           if (process.env.OPENCODE_DEBUG) {
-            await safeLog(output.system[1], {sessionId, source: 'on routing block injection'});
+            await safeLog(text(system[1]), {sessionId, source: 'on routing block injection'});
           }
         } else if (process.env.OPENCODE_DEBUG) {
           await safeLog(`routing block skipped — system prompt already contains context-mode instructions`, {sessionId, source: 'on routing block injection'});
@@ -727,7 +753,7 @@ async function createContextModePlugin(ctx: PluginContext) {
           });
         }
 
-        if (Array.isArray(output?.system)) {
+        if (Array.isArray(system)) {
           // Insert at index 1 (after the header) — NOT unshift.
           // OpenCode's llm.ts:117-128 saves `header = system[0]` BEFORE this
           // hook runs and then folds the rest into a 2-part structure
@@ -738,10 +764,10 @@ async function createContextModePlugin(ctx: PluginContext) {
           // provider prompt cache is invalidated on every resume injection.
           // Inserting at index 1 keeps the header invariant and lets the
           // snapshot ride along inside the cached body block.
-          output.system.splice(1, 0, row.snapshot);
+          system.splice(1, 0, part(row.snapshot));
           // Mark consumed only AFTER successful splice so failed paths can retry
           if (process.env.OPENCODE_DEBUG) {
-            await safeLog(output.system[1], { sessionId, source: "on resume" });
+            await safeLog(text(system[1]), { sessionId, source: "on resume" });
           }
         }
       } catch {
@@ -751,10 +777,157 @@ async function createContextModePlugin(ctx: PluginContext) {
   };
 }
 
-// ── Exports ──────────────────────────────────────────────
-// KiloCode PluginModule: default export with { server } shape
-// OpenCode compat: named export for direct import("context-mode/plugin")
-export default { id:"context-mode", server: createContextModePlugin };
+/** The legacy public factory and hook signatures remain callable unchanged. */
+async function createContextModePlugin(ctx: PluginContext) {
+  const runtime = await initializePlugin(ctx?.directory ?? process.cwd(), (message, extra) =>
+    ctx.client.app.log({ body: { service: "context-mode-logger", level: "info", message, extra } }));
+  return {
+    tool: runtime.tool,
+    "tool.execute.before": async (input: BeforeHookInput, output: BeforeHookOutput) => {
+      // Preserve V1's process-based routing-throttle identity.
+      await runtime.before(input.tool ?? "", output.args ?? {});
+    },
+    "tool.execute.after": async (input: AfterHookInput, output: AfterHookOutput) => {
+      await runtime.after(input.sessionID, input.tool ?? "", input.args ?? {}, output.output);
+    },
+    event: async (input: EventHookInput) => {
+      // V1 message.updated: tokens are the last-step snapshot; cost is the
+      // cumulative message cost. Preserve the existing parser's semantics.
+      const event = input?.event;
+      if (event?.type === "message.updated" && event.properties?.info?.sessionID) {
+        await runtime.usage(event.properties.info.sessionID, event);
+      }
+    },
+    "chat.message": async (input: ChatMessageHookInput, output: ChatMessageHookOutput) => {
+      const text = output?.parts?.find((part) => part?.type === "text" && part.text)?.text;
+      if (text) await runtime.prompt(input?.sessionID, text);
+    },
+    "experimental.session.compacting": async (input: CompactingHookInput, output: CompactingHookOutput) => {
+      return runtime.compact(input.sessionID, output.context);
+    },
+    "experimental.chat.system.transform": async (input: SystemTransformHookInput, output: SystemTransformHookOutput) => {
+      await runtime.system(input?.sessionID, output.system, (text) => text, (text) => text);
+    },
+  };
+}
+
+const V2_TOOL_ALIASES: Record<string, string> = {
+  shell: "Bash", read: "Read", write: "Write", edit: "Edit", grep: "Grep",
+  glob: "Glob", webfetch: "WebFetch", subagent: "Agent", question: "AskUserQuestion",
+};
+const record = (value: unknown): Record<string, unknown> =>
+  value !== null && typeof value === "object" ? value as Record<string, unknown> : {};
+const textPart = (text: string): SystemPart => ({ type: "text", text });
+function resultText(result: ToolResult): string {
+  if (typeof result.content === "string") return result.content;
+  if (Array.isArray(result.content)) return result.content.filter((part) => part.type === "text").map((part) => part.text ?? "").join("\n");
+  return typeof result.output === "string" ? result.output : JSON.stringify(result.output ?? "");
+}
+
+async function setupOpenCodeV2(ctx: V2Context): Promise<() => Promise<void>> {
+  const projectDir = ctx.location.directory;
+  const runtime = await initializePlugin(projectDir, async (message, extra) => console.info("context-mode:", message, extra ?? ""));
+  const controller = new AbortController();
+  let stream: Promise<void> | undefined;
+  let cleanupPromise: Promise<void> | undefined;
+  const cleanup = () => cleanupPromise ??= (async () => {
+    controller.abort();
+    try { await stream; } finally { runtime.db.close(); }
+  })();
+  try {
+    await ctx.tool.transform((editor) => {
+      for (const [name, tool] of Object.entries(runtime.tool)) editor.add({
+        name, description: tool.description, options: { namespace: "context-mode" },
+        input: z.object(tool.args as Record<string, z.ZodType>),
+        async execute(input, context) {
+          const result = await tool.execute(input, { ...context, directory: projectDir, abort: context.signal });
+          return { content: typeof result === "string" ? result : result.output,
+            metadata: { title: typeof result === "string" ? name : result.title ?? name } };
+        },
+      });
+    });
+    await ctx.tool.hook("execute.before", async (event) => {
+      // Other plugins may use primitive/array schemas. Do not replace their
+      // inputs on passthrough; our routed builtins use object arguments.
+      if (event.input === null || typeof event.input !== "object" || Array.isArray(event.input)) return;
+      const input = record(event.input);
+      await runtime.before(V2_TOOL_ALIASES[event.tool] ?? event.tool, input, event.sessionID, true);
+    });
+    await ctx.tool.hook("execute.after", async (event) => {
+      const input = { ...record(event.input) };
+      if (input.path !== undefined && input.file_path === undefined) input.file_path = input.path;
+      await runtime.after(event.sessionID, V2_TOOL_ALIASES[event.tool] ?? event.tool, input,
+        event.status === "completed" ? resultText(event.result) : event.error.message,
+        event.status === "error" ? true : undefined);
+    });
+    await ctx.session.hook("prompt", async (event) => runtime.prompt(event.sessionID, event.prompt.text));
+    await ctx.session.hook("context", async (event) => {
+      // Quorum markers use bare ctx_* names; V2 exposes namespaced tool IDs.
+      // Its generated Code Mode catalog lists tool names but is NOT routing
+      // guidance. Exclude that part from the quorum's read-only view.
+      await runtime.system(event.sessionID, event.system,
+        (part) => part.text.startsWith("# Code Mode\n") ? "" : part.text.replaceAll("context-mode_ctx_", "ctx_"), textPart);
+    });
+    await ctx.session.hook("compaction", async (event) => {
+      // A new native cycle starts with a fresh system array. Reprocessing this
+      // operation must not increment counts/inject twice; ordinary mentions of
+      // session_resume in user rules are NOT evidence of a previous injection.
+      if (event.system.some((part) => part.metadata?.source === "context-mode-compaction")) return;
+      const context: string[] = [];
+      await runtime.compact(event.sessionID, context);
+      for (const text of context) event.system.push({ ...textPart(text), metadata: { source: "context-mode-compaction" } });
+      // Do not assign event.result: that would SKIP OpenCode's native summary.
+    });
+
+    // session.usage.updated is cumulative across the SESSION, not a delta.
+    // Correlate per-step model metadata with ended tokens/cost instead.
+    const models = new Map<string, { modelID?: string; providerID?: string }>();
+    stream = (async () => {
+      try {
+        for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
+          if (controller.signal.aborted) break;
+          if (event.type !== "session.step.started" && event.type !== "session.step.ended") continue;
+          const data = record(event.data);
+          if (typeof data.sessionID !== "string" || typeof data.assistantMessageID !== "string") continue;
+          // Public events can be from other locations. An explicit foreign
+          // location overrides historical membership (e.g. a session moved).
+          if (event.location) {
+            if (resolve(event.location.directory) !== resolve(projectDir)) continue;
+          } else if (!runtime.db.getSessionStats(data.sessionID)) continue;
+          const key = data.assistantMessageID;
+          if (event.type === "session.step.started") {
+            const model = record(data.model);
+            models.set(key, {
+              modelID: typeof model.id === "string" ? model.id : undefined,
+              providerID: typeof model.providerID === "string" ? model.providerID : undefined,
+            });
+          } else {
+            const model = models.get(key);
+            // Only an admitted start can settle once. The public stream is
+            // live (not a replay feed); deleting also bounds completed state.
+            if (!model) continue;
+            models.delete(key);
+            await runtime.usage(data.sessionID, { ...model, role: "assistant", tokens: data.tokens, cost: data.cost }, event.id);
+          }
+          // Failed/interrupted steps may never end; bound their metadata.
+          if (models.size > 500) models.delete(models.keys().next().value!);
+        }
+      } catch (error) {
+        if (!controller.signal.aborted) console.error("context-mode: event subscription failed", error);
+      }
+    })();
+    return cleanup;
+  } catch (error) {
+    await cleanup();
+    throw error;
+  }
+}
+
+export default {
+  id: "context-mode",
+  server: createContextModePlugin,
+  setup: setupOpenCodeV2,
+};
 export { createContextModePlugin as ContextModePlugin };
-// Test surface — exported for unit testing the quorum substring fix (#487).
+// Test surface for the quorum substring fix (#487).
 export { systemHasRoutingInstructions, ROUTING_MARKERS };

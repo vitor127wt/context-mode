@@ -27,7 +27,7 @@ let routePreToolUse: (
   projectDir?: string,
   platform?: string,
   sessionId?: string,
-  options?: { mcpToolsAvailable?: boolean },
+  options?: { mcpToolsAvailable?: boolean; nativeToolsAvailable?: boolean },
 ) => {
   action: string;
   reason?: string;
@@ -468,6 +468,55 @@ describe("routePreToolUse", () => {
       expect(result).not.toBeNull();
       expect(result!.action).toBe("deny");
       expect(result!.reason).toContain("ctx_fetch_and_index");
+    });
+
+    it("bypasses isMCPReady check when nativeToolsAvailable is true", () => {
+      // Create an isolated empty sentinel directory to ensure isMCPReady() is false
+      const emptySentinelDir = mkdtempSync(join(tmpdir(), "cm-no-mcp-sentinel-"));
+      const prevSentinelDir = process.env.CONTEXT_MODE_MCP_SENTINEL_DIR;
+      process.env.CONTEXT_MODE_MCP_SENTINEL_DIR = emptySentinelDir;
+
+      try {
+        const curlInput = { command: "curl https://example.com" };
+
+        // 1. Without nativeToolsAvailable (default): returns null because MCP is not ready
+        const defaultRes = routePreToolUse(
+          "Bash",
+          curlInput,
+          undefined,
+          "opencode",
+          "sess-no-native",
+        );
+        expect(defaultRes).toBeNull();
+
+        // 2. With nativeToolsAvailable: true: returns redirect even when no MCP sentinel exists
+        const nativeRes = routePreToolUse(
+          "Bash",
+          curlInput,
+          undefined,
+          "opencode",
+          "sess-with-native",
+          { nativeToolsAvailable: true },
+        );
+        expect(nativeRes).not.toBeNull();
+        expect(nativeRes!.action).toBe("modify");
+        expect(nativeRes!.updatedInput?.command).toContain("context-mode");
+
+        // 3. When mcpToolsAvailable is explicitly false, it still overrides and returns null
+        const blockedRes = routePreToolUse(
+          "Bash",
+          curlInput,
+          undefined,
+          "opencode",
+          "sess-blocked-native",
+          { nativeToolsAvailable: true, mcpToolsAvailable: false },
+        );
+        expect(blockedRes).toBeNull();
+      } finally {
+        if (prevSentinelDir === undefined) delete process.env.CONTEXT_MODE_MCP_SENTINEL_DIR;
+        else process.env.CONTEXT_MODE_MCP_SENTINEL_DIR = prevSentinelDir;
+        rmSync(emptySentinelDir, { recursive: true, force: true });
+      }
     });
 
     it("Claude Code pretooluse treats subagent hook payloads as ctx_* unavailable (#794)", async () => {

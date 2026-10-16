@@ -21,13 +21,17 @@ import { existsSync, mkdirSync, rmSync, rmdirSync, readdirSync, unlinkSync, open
 
 /**
  * Guard for actions that redirect to MCP tools (#230).
- * If MCP server isn't ready, returns null (passthrough) instead of the
- * redirect action — prevents agent from getting stuck when MCP tools
- * are unavailable. Applies to deny and modify actions that mention MCP alternatives.
+ * If MCP server isn't ready and native tools are not available, returns null
+ * (passthrough) instead of the redirect action — prevents agent from getting stuck
+ * when MCP tools are unavailable. Applies to deny and modify actions that mention MCP alternatives.
+ *
+ * When nativeToolsAvailable is true (in-process host registration such as OpenCode V2),
+ * the isMCPReady sentinel check is bypassed since tools are available directly in-process.
+ * If mcpToolsAvailable is false (e.g. subagents), redirect is still blocked.
  */
-function mcpRedirect(result, mcpToolsAvailable = true) {
+function mcpRedirect(result, mcpToolsAvailable = true, nativeToolsAvailable = false) {
   if (!mcpToolsAvailable) return null;
-  if (!isMCPReady()) return null;
+  if (!nativeToolsAvailable && !isMCPReady()) return null;
   return result;
 }
 import { homedir, tmpdir } from "node:os";
@@ -666,9 +670,12 @@ function getPlatformSettingsPath(platform) {
  * @param {boolean} [options.mcpToolsAvailable=true] - False when the current
  *   caller context cannot invoke ctx_* MCP tools even though an MCP server is
  *   live on the machine (Claude Code fixed-tool subagents — #794).
+ * @param {boolean} [options.nativeToolsAvailable=false] - Tools registered
+ *   in-process by this caller; no MCP readiness sentinel is necessary.
  */
 export function routePreToolUse(toolName, toolInput, projectDir, platform, sessionId, options = {}) {
   const mcpToolsAvailable = options.mcpToolsAvailable !== false;
+  const nativeToolsAvailable = options.nativeToolsAvailable === true;
 
   // ─── Opt-in fail-closed gate (#468 follow-up) ───
   // Default behavior on security-module load failure is fail-OPEN (a stderr
@@ -779,7 +786,7 @@ export function routePreToolUse(toolName, toolInput, projectDir, platform, sessi
             bytesAvoided: 8192,
             commandSummary: command.slice(0, 200),
           },
-        }, mcpToolsAvailable);
+        }, mcpToolsAvailable, nativeToolsAvailable);
       }
       // All segments safe → allow through
       return null;
@@ -801,7 +808,7 @@ export function routePreToolUse(toolName, toolInput, projectDir, platform, sessi
         updatedInput: {
           command: `echo "context-mode: Inline HTTP redirected. Call ${t("ctx_execute")}(language, code) to fetch, derive your answer in code, and console.log() only the result — the raw response body stays in the sandbox instead of entering your conversation. Full network access. Retry the same call on a transient DNS error (EAI_AGAIN, ETIMEDOUT, ENETUNREACH)."`,
         },
-      }, mcpToolsAvailable);
+      }, mcpToolsAvailable, nativeToolsAvailable);
     }
 
     // Build tools (gradle, maven, sbt) → redirect to execute sandbox (Issue #38, #406).
@@ -814,7 +821,7 @@ export function routePreToolUse(toolName, toolInput, projectDir, platform, sessi
         updatedInput: {
           command: `echo "context-mode: Build tool redirected. Call ${t("ctx_execute")}(language: \\"shell\\", code: \\"${safeCmd} 2>&1 | tail -30\\") to run the build and print only the tail — the verbose build log stays in the sandbox instead of entering your conversation. For more targeted output, replace \\"tail -30\\" with \\"grep -E '(error|warning|FAIL|✗|×)'\\" or similar, so only the lines that matter come back."`,
         },
-      }, mcpToolsAvailable);
+      }, mcpToolsAvailable, nativeToolsAvailable);
     }
 
     // Skip the routing nudge for commands whose output is structurally
@@ -886,7 +893,7 @@ export function routePreToolUse(toolName, toolInput, projectDir, platform, sessi
         bytesAvoided: 16384,
         commandSummary: String(url).slice(0, 200),
       },
-    }, mcpToolsAvailable);
+    }, mcpToolsAvailable, nativeToolsAvailable);
   }
 
   // ─── Agent: inject context-mode routing into subagent prompts ───

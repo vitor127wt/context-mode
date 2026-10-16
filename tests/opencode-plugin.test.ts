@@ -8,7 +8,7 @@ import "./setup-home";
  *   - experimental.session.compacting (snapshot generation)
  */
 
-import { describe, it, expect, beforeAll, beforeEach, afterAll, afterEach } from "vitest";
+import { describe, it, expect, beforeAll, beforeEach, afterAll, afterEach, vi } from "vitest";
 import { mkdtempSync, rmSync, existsSync, mkdirSync, writeFileSync, unlinkSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -1346,6 +1346,268 @@ describe("ContextModePlugin", () => {
       // Dedup branch unchanged (skipped routing block)
       expect(out.system.length).toBe(2);
       expect(out.system[1]).toBe(agentsContent);
+    });
+  });
+  describe("OpenCode V2 native plugin", () => {
+    type Context = Parameters<(typeof import("../src/adapters/opencode/plugin.js"))["default"]["setup"]>[0];
+    type Editor = Parameters<Parameters<Context["tool"]["transform"]>[0]>[0];
+    type Tool = Parameters<Editor["add"]>[0];
+    type BusEvent = ReturnType<Context["event"]["subscribe"]> extends AsyncIterable<infer Event> ? Event : never;
+    const cleanups: Array<() => Promise<void>> = [];
+    let previousSentinelDir: string | undefined;
+    beforeEach(() => {
+      previousSentinelDir = process.env.CONTEXT_MODE_MCP_SENTINEL_DIR;
+      const empty = join(tempDir, "v2-empty-sentinels");
+      mkdirSync(empty, { recursive: true });
+      process.env.CONTEXT_MODE_MCP_SENTINEL_DIR = empty;
+    });
+    afterEach(async () => {
+      for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
+      if (previousSentinelDir === undefined) delete process.env.CONTEXT_MODE_MCP_SENTINEL_DIR;
+      else process.env.CONTEXT_MODE_MCP_SENTINEL_DIR = previousSentinelDir;
+    });
+
+    async function fixture() {
+      const { default: plugin } = await import("../src/adapters/opencode/plugin.js");
+      const { SessionDB, resolveSessionDbPath } = await import("../src/session/db.js");
+      const { OpenCodeAdapter } = await import("../src/adapters/opencode/index.js");
+      const directory = mkdtempSync(join(tempDir, "v2-"));
+      const tools = new Map<string, Tool>();
+      // Heterogeneous host callback registry: the cast is confined to this
+      // test boundary. Production setup is also checked against the real SDK.
+      const hooks = new Map<string, (event: never) => Promise<void>>();
+      const queue: BusEvent[] = [];
+      let pending: ((result: IteratorResult<BusEvent>) => void) | undefined;
+      let aborted = false;
+      let signal: AbortSignal | undefined;
+      const ctx: Context = {
+        location: { directory },
+        tool: {
+          async transform(callback) { callback({ add(tool) { tools.set(`context-mode_${tool.name}`, tool); } }); },
+          async hook(name, callback) { hooks.set(name, callback as (event: never) => Promise<void>); },
+        },
+        session: { async hook(name, callback) { hooks.set(name, callback as (event: never) => Promise<void>); } },
+        event: { subscribe(options) {
+          signal = options.signal;
+          signal.addEventListener("abort", () => {
+            aborted = true;
+            pending?.({ done: true, value: undefined });
+          }, { once: true });
+          return { [Symbol.asyncIterator]() { return {
+            next(): Promise<IteratorResult<BusEvent>> {
+              if (queue.length) return Promise.resolve({ done: false, value: queue.shift()! });
+              if (aborted) return Promise.resolve({ done: true, value: undefined });
+              return new Promise((resolve) => { pending = resolve; });
+            },
+          }; } };
+        } },
+      };
+      const cleanup = await plugin.setup(ctx);
+      const db = new SessionDB({ dbPath: resolveSessionDbPath({ projectDir: directory,
+        sessionsDir: new OpenCodeAdapter("opencode").getSessionDir() }) });
+      cleanups.push(async () => { await cleanup(); db.close(); });
+      const hook = async (name: string, event: object) => {
+        expect(hooks.has(name), `${name} must be registered`).toBe(true);
+        await hooks.get(name)!(event as never);
+      };
+      const call = (tool: string, input: unknown, sessionID = "session-v2") => ({
+        tool, input, sessionID, id: "call-v2", agent: "build", messageID: "message-v2",
+      });
+      const emit = async (event: BusEvent) => {
+        if (pending) { const resolve = pending; pending = undefined; resolve({ done: false, value: event }); }
+        else queue.push(event);
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      };
+      const execute = async (name: string, input: unknown) => {
+        const tool = tools.get(`context-mode_${name}`)!;
+        // Mirror V2's Standard Schema decode boundary, including transformed
+        // values. Calling execute(raw) alone would mask a broken host schema.
+        const decoded = await tool.input["~standard"].validate(input);
+        if (decoded.issues) throw new Error(JSON.stringify(decoded.issues));
+        return tool.execute(decoded.value as Record<string, unknown>, {
+          sessionID: "session-v2", messageID: "message-v2", agent: "build",
+          signal: new AbortController().signal, progress: async () => {},
+        });
+      };
+      return { ctx, directory, tools, hook, call, emit, execute, db, cleanup, signal: () => signal };
+    }
+
+    it("preserves the V1/Kilo factory and exposes the V2 default definition", async () => {
+      const mod = await import("../src/adapters/opencode/plugin.js");
+      expect(mod.default.id).toBe("context-mode");
+      expect(mod.default.server).toBe(mod.ContextModePlugin);
+      expect(typeof mod.default.setup).toBe("function");
+    });
+
+    it("registers all eleven names/descriptions and host-convertible Standard Schemas", async () => {
+      const f = await fixture();
+      expect([...f.tools.keys()].sort()).toEqual([
+        "ctx_batch_execute", "ctx_doctor", "ctx_execute", "ctx_execute_file", "ctx_fetch_and_index",
+        "ctx_index", "ctx_insight", "ctx_purge", "ctx_search", "ctx_stats", "ctx_upgrade",
+      ].map((name) => `context-mode_${name}`));
+      const z = (await import("zod/v4")).default;
+      for (const [name, tool] of f.tools) {
+        expect(tool.description.length, name).toBeGreaterThan(0);
+        expect(tool.options.namespace).toBe("context-mode");
+        expect(z.toJSONSchema(tool.input, { io: "input" }).type, name).toBe("object");
+        expect(tool.input["~standard"].vendor).toBe("zod");
+      }
+    });
+
+    it("executes ctx_stats and ctx_execute through schema decoding without a root output", async () => {
+      const f = await fixture();
+      const stats = await f.execute("ctx_stats", {});
+      expect(stats.content).toContain("context-mode");
+      expect(stats).not.toHaveProperty("output");
+      const executed = await f.execute("ctx_execute", { language: "javascript", code: 'console.log("native-v2-ok")', background: "false" });
+      expect(executed.content).toContain("native-v2-ok");
+      expect(executed.metadata.title).toBeTruthy();
+    });
+
+    it("preserves preprocessing, coercions and defaults before execution", async () => {
+      const f = await fixture();
+      expect(f.tools.get("context-mode_ctx_search")!.input.parse({ queries: "bare query", limit: "4" }))
+        .toMatchObject({ queries: ["bare query"], limit: 4, sort: "relevance" });
+      expect(f.tools.get("context-mode_ctx_batch_execute")!.input.parse({
+        commands: '[{"label":"sample","command":"echo v2"}]', queries: '["v2"]',
+      })).toMatchObject({ commands: [{ label: "sample", command: "echo v2" }], queries: ["v2"], concurrency: 1 });
+      expect(f.tools.get("context-mode_ctx_purge")!.input.parse({ confirm: "false" })).toMatchObject({ confirm: false });
+      const result = await f.execute("ctx_batch_execute", {
+        commands: '[{"label":"sample","command":"echo v2-batch-output"}]', queries: "v2-batch-output",
+      });
+      expect(result.content).toContain("Executed");
+      await expect(f.execute("ctx_batch_execute", { queries: [] })).rejects.toThrow();
+    });
+
+    it("redirects shell and denies webfetch with an empty MCP sentinel directory", async () => {
+      const f = await fixture();
+      const sessionID = f.directory.slice(-6);
+      const { resetGuidanceThrottle } = await import("../hooks/core/routing.mjs");
+      resetGuidanceThrottle(sessionID);
+      const shell = f.call("shell", { command: "curl https://example.com" }, sessionID);
+      await f.hook("execute.before", shell);
+      expect(shell.input.command).toMatch(/^echo /);
+      expect(shell.input.command).toContain("context-mode_ctx_execute");
+      await expect(f.hook("execute.before", f.call("webfetch", { url: "https://example.com" })))
+        .rejects.toThrow("WebFetch redirected");
+      const grep = f.call("grep", { pattern: "abc" }, sessionID);
+      await f.hook("execute.before", grep);
+      expect(grep.input).toHaveProperty("additionalContext", expect.stringContaining("<context_guidance>"));
+      const foreignTool = f.call("another-plugin-tool", "primitive input");
+      await f.hook("execute.before", foreignTool);
+      expect(foreignTool.input).toBe("primitive input");
+    });
+
+    it("persists successful reads/git and tool failures without mutating native inputs", async () => {
+      const f = await fixture();
+      const input = { path: "/src/v2-file.ts" };
+      await f.hook("execute.after", { ...f.call("read", input), status: "completed", result: { content: [{ type: "text", text: "source" }] } });
+      await f.hook("execute.after", { ...f.call("shell", { command: "git commit -m v2-commit" }), status: "completed", result: { content: "[main abc] v2-commit" } });
+      await f.hook("execute.after", { ...f.call("shell", { command: "false" }), status: "error", error: { message: "native tool failure" } });
+      expect(input).toEqual({ path: "/src/v2-file.ts" });
+      const events = f.db.getEvents("session-v2");
+      expect(events.some((e) => e.type === "file_read" && e.data.includes("v2-file.ts"))).toBe(true);
+      expect(events.some((e) => e.data.includes("v2-commit"))).toBe(true);
+      expect(events.some((e) => e.type === "error_tool" && e.data.includes("native tool failure"))).toBe(true);
+    });
+
+    it("captures prompts/rules for the correct project and filters synthetic messages", async () => {
+      const f = await fixture();
+      writeFileSync(join(f.directory, "AGENTS.md"), "Use native V2 tools carefully.");
+      await f.hook("prompt", { sessionID: "session-v2", prompt: { text: "Build the feature" } });
+      await f.hook("prompt", { sessionID: "session-v2", prompt: { text: "<system-reminder>not user input</system-reminder>" } });
+      const events = f.db.getEvents("session-v2");
+      expect(events.filter((e) => e.type === "user_prompt").map((e) => e.data)).toEqual(["Build the feature"]);
+      expect(events.some((e) => e.type === "rule_content" && e.data.includes("Use native V2"))).toBe(true);
+      expect(f.db.getSessionStats("session-v2")?.project_dir).toBe(f.directory);
+    });
+
+    it("preserves structured context identity/cache/metadata and does not duplicate routing", async () => {
+      const f = await fixture();
+      const header = { type: "text", text: "HEADER", cache: { type: "ephemeral" as const }, metadata: { source: "host" } };
+      const body = { type: "text", text: '# Code Mode\nAvailable tools: tools["context-mode"].ctx_search and tools["context-mode"].ctx_index', metadata: { preserve: true } };
+      const event = { sessionID: "session-v2", system: [header, body] };
+      await f.hook("context", event);
+      expect(event.system[0]).toBe(header);
+      expect(event.system.at(-1)).toBe(body);
+      expect(event.system[0].cache).toBe(header.cache);
+      expect(event.system[0].metadata).toBe(header.metadata);
+      expect(event.system[1].text).toContain("context-mode_ctx_search");
+      await f.hook("context", event);
+      expect(event.system.length).toBe(3);
+    });
+
+    it("preserves native summarization, deduplicates the same compaction and permits fresh cycles", async () => {
+      const f = await fixture();
+      await f.hook("prompt", { sessionID: "session-v2", prompt: { text: "Keep this decision" } });
+      const event = { sessionID: "session-v2", system: [{ type: "text", text: "Mention session_resume in ordinary instructions" }], result: undefined };
+      await f.hook("compaction", event);
+      expect(event.result).toBeUndefined();
+      expect(event.system.filter((part) => part.text.includes("<session_resume"))).toHaveLength(1);
+      const length = event.system.length;
+      await f.hook("compaction", { ...event });
+      expect(event.system.length).toBe(length);
+      expect(f.db.getSessionStats("session-v2")?.compact_count).toBe(1);
+      const fresh = { ...event, system: [{ type: "text", text: "Fresh native cycle" }] };
+      await f.hook("compaction", fresh);
+      expect(fresh.result).toBeUndefined();
+      expect(f.db.getSessionStats("session-v2")?.compact_count).toBe(2);
+      const self = { sessionID: "session-v2", system: [{ type: "text", text: "HEADER" }] };
+      await f.hook("context", self);
+      expect(self.system.some((part) => part.text.includes("<session_resume"))).toBe(false);
+      const next = { ...self, sessionID: "next-session", system: [{ type: "text", text: "NEXT HEADER" }] };
+      await f.hook("context", next);
+      expect(next.system.some((part) => part.text.includes("Keep this decision"))).toBe(true);
+    });
+
+    it("records exact step deltas/model, ignores cumulative/foreign usage and cleans up on reload", async () => {
+      const f = await fixture();
+      await f.hook("prompt", { sessionID: "session-v2", prompt: { text: "Track usage" } });
+      const location = { directory: f.directory };
+      const data = { sessionID: "session-v2", assistantMessageID: "message-v2", tokens: { input: 200, output: 50, cache: { read: 20, write: 0 } }, cost: 0.002 };
+      await f.emit({ id: "cumulative", type: "session.usage.updated", location, data: { ...data, cost: 100 } });
+      for (const step of [1, 2]) {
+        await f.emit({ id: `start-${step}`, type: "session.step.started", location,
+          data: { ...data, model: { id: "test-model", providerID: "test-provider" } } });
+        await f.emit({ id: `end-${step}`, type: "session.step.ended", location, data });
+      }
+      await f.emit({ id: "end-2", type: "session.step.ended", location, data });
+      await f.emit({ id: "foreign-start", type: "session.step.started", location: { directory: "/foreign-project" }, data: { ...data, model: { id: "foreign" } } });
+      await f.emit({ id: "foreign-end", type: "session.step.ended", location: { directory: "/foreign-project" }, data: { ...data, cost: 100 } });
+      const usage = f.db.getEvents("session-v2").filter((event) => event.type === "agent_usage");
+      expect(usage).toHaveLength(2);
+      for (const event of usage) {
+        expect(event.data).toContain("test-provider/test-model");
+        expect(event.data).toContain("tokens_in:200");
+        expect(event.data).toContain("cost_usd:0.002");
+      }
+      await f.cleanup();
+      await f.cleanup();
+      expect(f.signal()?.aborted).toBe(true);
+      const reloaded = await fixture();
+      expect(reloaded.signal()?.aborted).toBe(false);
+    });
+
+    it("rejects partial setup failures instead of reporting a loaded but inert plugin", async () => {
+      const f = await fixture();
+      const { default: plugin } = await import("../src/adapters/opencode/plugin.js");
+      await expect(plugin.setup({ ...f.ctx, tool: { ...f.ctx.tool, transform: async () => { throw new Error("registration failed"); } } }))
+        .rejects.toThrow("registration failed");
+    });
+
+    it("reports unexpected subscription errors and still permits cleanup", async () => {
+      const f = await fixture();
+      const { default: plugin } = await import("../src/adapters/opencode/plugin.js");
+      const error = new Error("stream transport failed");
+      const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+      try {
+        const cleanup = await plugin.setup({ ...f.ctx, event: { subscribe: async function* () { throw error; } } });
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        expect(logged).toHaveBeenCalledWith("context-mode: event subscription failed", error);
+        await cleanup();
+      } finally {
+        logged.mockRestore();
+      }
     });
   });
 });
