@@ -1,4 +1,47 @@
-# Context Mode
+# Context Mode — OpenCode 2.x compatibility fork
+
+> Fork of [mksglu/context-mode](https://github.com/mksglu/context-mode), focused on repairing the **native OpenCode 2.x plugin** while preserving the legacy OpenCode/KiloCode entrypoints. The changes live on [`fix/opencode-v2`](https://github.com/vitor127wt/context-mode/tree/fix/opencode-v2).
+
+## What changed in this fork
+
+OpenCode 2 rejects the upstream plugin definition with:
+
+```text
+Plugin must export a default definition with an id and an effect or setup function.
+```
+
+This fork adds a native `setupOpenCodeV2` entrypoint alongside the existing `server: createContextModePlugin` export. Both reuse the adapter's existing tool executors, routing, SQLite persistence and session-continuity operations; no MCP workaround or runtime OpenCode SDK dependency is introduced.
+
+- **All 11 `ctx_*` tools** are registered natively with their existing schemas, preprocessing, coercions and defaults. OpenCode 2 exposes them as `context-mode_ctx_*` and through Code Mode as `tools["context-mode"].ctx_*`.
+- **Tool before/after and session prompt/context/compaction hooks** remain functional, including argument mutation, rejection, prompt capture and snapshots. Existing structured system parts retain their cache hints and metadata; compaction does not replace OpenCode's native summary.
+- **Usage telemetry** records per-step model/token/cost data rather than double-counting cumulative session totals. Cleanup cancels the subscription and closes the owned session DB on unload/reload.
+- **Native routing no longer depends on an MCP readiness sentinel.** The new readiness option is opt-in for V2; legacy routing defaults and named exports are preserved.
+
+### Validation and limitations
+
+Validated on **Linux with the real OpenCode 2.0.29 binary**, isolated configuration/storage and a local mock provider: the plugin loads without the default-definition error, all 11 tools appear, `ctx_stats` executes, routing and persistence work, native compaction runs, and reload leaves one active subscription. Build and typecheck pass; the full suite on the upstream `next` base passed with **4,767 tests, 45 pre-existing skips and zero failures** across 213 test files.
+
+Windows/macOS binaries, paid/real providers and actual V1/KiloCode binaries have **not** been manually tested; existing legacy regression tests pass. The V2 Code Mode catalog check follows the layout emitted by 2.0.29. Unexpected event-stream failures are logged; this patch does not add a reconnection subsystem.
+
+### Using the corrected native plugin
+
+**This fork has not been published to npm.** The npm package, marketplace links and installation commands in the upstream documentation below still refer to the upstream project, not this fork.
+
+Clone this repository's `fix/opencode-v2` branch and follow the [source build instructions](CONTRIBUTING.md#build-and-test-your-changes). After building, a local OpenCode 2 plugin can reexport the compiled default definition:
+
+```ts
+// <your-project>/.opencode/plugins/context-mode.ts
+// Replace the path with the absolute path to your built checkout of this fork.
+export { default } from "/absolute/path/to/context-mode/build/adapters/opencode/plugin.js";
+```
+
+This uses OpenCode's native plugin autoloading, not MCP. Do not load a second upstream `context-mode` plugin alongside it. No package rename, npm release or changes to your global OpenCode service are part of this fork's validation.
+
+---
+
+## Upstream project documentation
+
+The original project documentation and attribution are retained below. Its usage metrics, badges and hosted services describe upstream, not adoption or releases of this fork.
 
 **The other half of the context problem.**
 
